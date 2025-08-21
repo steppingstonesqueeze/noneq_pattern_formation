@@ -16,12 +16,15 @@ library(ggplot2)
 RG_R <- c(0.05, 0.15, 0.25)     # linear growth parameter r
 RG_G <- c(0.6, 1.0, 1.4)        # cubic coefficient g
 
+RG_R <- seq(0.05, 0.55, by = 0.1)
+RG_G <- seq(0.6, 1, by = 0.05)
+
 # Simulation params (keep modest for sweep)
-nx <- 160; ny <- 160            # even
+nx <- 192; ny <- 192            # even
 Lx <- 2*pi; Ly <- 2*pi
 dx <- Lx / nx; dy <- Ly / ny    # assume dx=dy
-dt <- 0.10
-steps <- 1600                   # steps per (r,g)
+dt <- 0.05
+steps <- 1500                  # steps per (r,g)
 eta <- 0.05                     # additive noise amplitude (eta*sqrt(dt)*N)
 seed <- 42
 
