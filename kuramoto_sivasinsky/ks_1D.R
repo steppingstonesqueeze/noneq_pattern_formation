@@ -14,7 +14,7 @@ library(ggplot2)
 N <- 512                  # grid (even)
 L <- 2*pi                 # domain length
 dx <- L / N
-dt <- 0.001              # stable step
+dt <- 0.01              # stable step
 nsteps <- 15000
 save_every <- 100
 seed <- 3
