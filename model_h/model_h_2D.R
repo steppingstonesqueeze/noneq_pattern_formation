@@ -11,7 +11,7 @@ suppressPackageStartupMessages({
 library(ggplot2)
 
 # ---------------- User params ----------------
-nx <- 160; ny <- 160              # grid (even)
+nx <- 192; ny <- 192              # grid (even)
 Lx <- 2*pi; Ly <- 2*pi
 dx <- Lx/nx; dy <- Ly/ny          # assume dx=dy
 dt <- 0.05                        # small for advective CFL
