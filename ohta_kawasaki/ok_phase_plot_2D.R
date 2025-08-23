@@ -10,12 +10,12 @@ suppressPackageStartupMessages({
 library(ggplot2)
 
 # -------- sweep params --------
-ALPHAS <- c(0.03, 0.06, 0.10)     # nonlocal strength α
-MEANS  <- c(0.00, 0.20, -0.20)    # average composition m̄
+ALPHAS <- c(0.03, 0.06, 0.09, 0.12, 0.15)     # nonlocal strength α
+MEANS  <- c(-0.40, -0.20, 0.0, 0.20, 0.40)    # average composition m̄
 nx <- 160; ny <- 160
 Lx <- 2*pi; Ly <- 2*pi
 dx <- Lx/nx; dy <- Ly/ny          # assume dx = dy
-dt <- 0.05                        # smaller, safer default
+dt <- 0.01                      # smaller, safer default
 steps <- 1600
 epsilon <- 0.02
 Mmob <- 1.0
