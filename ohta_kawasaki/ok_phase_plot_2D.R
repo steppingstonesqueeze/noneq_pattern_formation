@@ -1,6 +1,7 @@
-# ok_phase_plot_fd.R
+# ok_phase_plot_fd.R  (robust V2)
 # Ohta–Kawasaki phase sweep (no FFT anywhere).
-# Periodic FD semi-implicit solver, structure-tensor anisotropy + skewness classifier.
+# Periodic FD semi-implicit solver, stabilized IMEX, NA-safe CG, mass recentering.
+# Classifier: structure-tensor anisotropy + skewness (real space).
 # Outputs: ok_phase_metrics.csv, ok_phase_map.png, thumbs/
 
 suppressPackageStartupMessages({
@@ -9,17 +10,25 @@ suppressPackageStartupMessages({
 library(ggplot2)
 
 # -------- sweep params --------
-ALPHAS <- c(0.03, 0.06, 0.10)     # nonlocal strength
+ALPHAS <- c(0.03, 0.06, 0.10)     # nonlocal strength α
 MEANS  <- c(0.00, 0.20, -0.20)    # average composition m̄
 nx <- 160; ny <- 160
 Lx <- 2*pi; Ly <- 2*pi
-dx <- Lx/nx; dy <- Ly/ny
-dt <- 0.08
+dx <- Lx/nx; dy <- Ly/ny          # assume dx = dy
+dt <- 0.05                        # smaller, safer default
 steps <- 1600
 epsilon <- 0.02
 Mmob <- 1.0
 ic_amp <- 0.08
 seed <- 17
+
+# CG tolerances (looser early, tighter late)
+tol_initial <- 2e-6
+tol_final   <- 1e-8
+
+# Soft caps (safety nets; raise if too tight)
+cap_phi <- 5     # |phi| cap
+cap_psi <- 50    # |psi| cap
 
 # classifier thresholds
 ANISO_STRIPE_T <- 0.40
@@ -30,7 +39,7 @@ csv_out <- "ok_phase_metrics.csv"; png_out <- "ok_phase_map.png"
 
 set.seed(seed); stopifnot(nx %% 2 == 0, ny %% 2 == 0)
 
-# periodic ops
+# ---------- periodic ops ----------
 shiftL <- function(U) U[, c(2:ncol(U), 1)]
 shiftR <- function(U) U[, c(ncol(U), 1:(ncol(U)-1))]
 shiftU <- function(U) U[c(2:nrow(U), 1), ]
@@ -40,42 +49,89 @@ D1y <- function(U) (shiftU(U) - shiftD(U)) / (2*dy)
 lap <- function(U) (shiftL(U) + shiftR(U) + shiftU(U) + shiftD(U) - 4*U) / dx^2
 bilap <- function(U) lap(lap(U))
 
-# CG
-cg_solve <- function(apply_A, b, x0 = NULL, tol = 1e-8, maxit = 300, proj_zero_mean = FALSE) {
-  x <- if (is.null(x0)) matrix(0, nrow = nrow(b), ncol = ncol(b)) else x0
-  if (proj_zero_mean) b <- b - mean(b)
-  r <- b - apply_A(x); if (proj_zero_mean) r <- r - mean(r)
-  p <- r; rr <- sum(r*r); bnorm <- sqrt(sum(b*b)) + 1e-30
-  for (it in 1:maxit) {
-    Ap <- apply_A(p)
-    alpha <- rr / (sum(p*Ap) + 1e-30)
-    x <- x + alpha * p
-    r <- r - alpha * Ap
-    if (proj_zero_mean) r <- r - mean(r)
-    rr_new <- sum(r*r)
-    if (sqrt(rr_new) <= tol * bnorm) break
-    beta <- rr_new / (rr + 1e-30)
-    p <- r + beta * p
-    rr <- rr_new
+# ---------- helpers ----------
+sanitize <- function(U, cap = NA_real_) {
+  U[!is.finite(U)] <- 0
+  if (is.finite(cap)) {
+    U[U >  cap] <-  cap
+    U[U < -cap] <- -cap
   }
-  if (proj_zero_mean) x <- x - mean(x)
-  x
+  U
 }
 
+# ---------- NA-safe CG (matrix-free) ----------
+cg_solve <- function(apply_A, b, x0 = NULL, tol = 1e-8, maxit = 300, proj_zero_mean = FALSE) {
+  safe_dot <- function(a, b) {
+    s <- sum(as.numeric(a) * as.numeric(b), na.rm = TRUE)
+    if (!is.finite(s)) 0 else s
+  }
+  make_finite <- function(M) { M[!is.finite(M)] <- 0; M }
+  
+  x <- if (is.null(x0)) matrix(0, nrow = nrow(b), ncol = ncol(b)) else x0
+  if (proj_zero_mean) b <- b - mean(b)
+  b <- make_finite(b)
+  
+  Ax <- make_finite(apply_A(x))
+  r  <- make_finite(b - Ax)
+  if (proj_zero_mean) r <- r - mean(r)
+  p  <- r
+  
+  rr <- safe_dot(r, r)
+  bnorm <- sqrt(max(safe_dot(b, b), 0)) + 1e-30
+  
+  for (it in 1:maxit) {
+    Ap <- make_finite(apply_A(p))
+    denom <- safe_dot(p, Ap) + 1e-30
+    if (!is.finite(denom) || denom <= 0) {
+      warning("CG: non-positive or non-finite denominator; returning current iterate")
+      return(make_finite(x))
+    }
+    alpha <- rr / denom; if (!is.finite(alpha)) alpha <- 0
+    
+    x <- make_finite(x + alpha * p)
+    r <- make_finite(r - alpha * Ap)
+    if (proj_zero_mean) r <- r - mean(r)
+    
+    rr_new <- safe_dot(r, r)
+    if (!is.finite(rr_new)) {
+      warning("CG: non-finite residual; returning current iterate")
+      return(make_finite(x))
+    }
+    if (sqrt(rr_new) <= tol * bnorm) return(make_finite(x))
+    
+    beta <- rr_new / (rr + 1e-30); if (!is.finite(beta)) beta <- 0
+    p  <- make_finite(r + beta * p)
+    rr <- rr_new
+  }
+  make_finite(x)
+}
+
+# ---------- one OK simulation (stabilized IMEX) ----------
 simulate_OK <- function(alpha, m0, steps, dt) {
   phi <- matrix(m0 + ic_amp*(2*matrix(runif(nx*ny), ny, nx) - 1), nrow = ny, ncol = nx)
+  psi <- matrix(0, nrow = ny, ncol = nx)  # warm-start Poisson
   for (s in 1:steps) {
-    rhs_psi <- phi - mean(phi)                              # zero-mean RHS
-    psi <- cg_solve(function(U) -lap(U), b = rhs_psi, x0 = NULL, tol = 1e-8, maxit = 250, proj_zero_mean = TRUE)
-    mu_exp <- (phi^3 - phi) + alpha * psi
-    rhs_phi <- phi + dt * Mmob * ( lap(mu_exp) - lap(phi) ) # explicit pieces
-    phi <- cg_solve(function(U) U + dt*Mmob*epsilon^2*bilap(U),
-                    b = rhs_phi, x0 = phi, tol = 1e-8, maxit = 250)
+    tol_now <- if (s < steps/2) tol_initial else tol_final
+    
+    # Poisson: -∇² ψ = φ - φ̄ (zero-mean RHS)
+    rhs_psi <- phi - mean(phi)
+    psi <- cg_solve(function(U) -lap(U), b = rhs_psi, x0 = psi, tol = tol_now, maxit = 350, proj_zero_mean = TRUE)
+    psi <- sanitize(psi, cap = cap_psi)
+    
+    # Stabilized IMEX CH–OK:
+    # (I - dt M ∇² + dt M ε² ∇⁴) φ^{n+1} = φ^n + dt M [ ∇²(φ^3) + α ∇² ψ ]
+    rhs_phi <- phi + dt * Mmob * ( lap(phi^3) + alpha * lap(psi) )
+    A_phi   <- function(U) U - dt*Mmob*lap(U) + dt*Mmob*epsilon^2*bilap(U)
+    phi <- cg_solve(A_phi, b = rhs_phi, x0 = phi, tol = tol_now, maxit = 300)
+    phi <- sanitize(phi, cap = cap_phi)
+    
+    # Mass recentering (conserved mean)
+    phi <- phi + (m0 - mean(phi))
   }
   phi
 }
 
-# real-space metrics
+# ---------- real-space metrics ----------
 length_scale <- function(phi) {
   num <- sum(phi^2) * dx * dy
   den <- sum(D1x(phi)^2 + D1y(phi)^2) * dx * dy + 1e-30
@@ -100,13 +156,14 @@ classify <- function(A, S) {
   "labyrinth"
 }
 
-# sweep
+# ---------- sweep ----------
 res <- list()
 thumbs <- list()
 
 for (a in ALPHAS) {
   for (m in MEANS) {
     phi <- simulate_OK(alpha = a, m0 = m, steps = steps, dt = dt)
+    phi <- sanitize(phi, cap = cap_phi)
     A <- anisotropy(phi); S <- skewness(phi); Lc <- length_scale(phi)
     cls <- classify(A, S)
     
@@ -121,20 +178,20 @@ for (a in ALPHAS) {
     fn <- file.path(thumb_dir, sprintf("thumb_a%.3f_m%.2f.png", a, m))
     ggsave(fn, p, width = 2.2, height = 2.2, dpi = 120)
     thumbs[[length(thumbs)+1]] <- data.frame(alpha = a, mbar = m, thumb = fn)
-    message(sprintf("[OK] alpha=%.3f  m̄=%.2f  -> %s  (A=%.2f, skew=%.2f, L=%.3f)", a, m, cls, A, S, Lc))
+    message(sprintf("[OK] α=%.3f  m̄=%.2f  -> %s  (A=%.2f, skew=%.2f, L=%.3f)", a, m, cls, A, S, Lc))
   }
 }
 
 res_df <- do.call(rbind, res)
 write.csv(res_df, csv_out, row.names = FALSE)
 
-# phase map
+# ---------- phase map ----------
 pal <- c(stripes = "#1f78b4", spots_up = "#e31a1c", spots_down = "#fb9a99", labyrinth = "#6a3d9a")
 phase_plot <- ggplot(res_df, aes(x = factor(alpha), y = factor(mbar), fill = class)) +
   geom_tile(color = "grey30") +
   scale_fill_manual(values = pal) +
   labs(x = "α (nonlocal)", y = "m̄ (mean composition)", fill = "class",
-       title = "Ohta–Kawasaki phase map (FD, no FFT)") +
+       title = "Ohta–Kawasaki phase map (FD, stabilized IMEX, no FFT)") +
   theme_minimal(base_size = 12)
 ggsave(png_out, phase_plot, width = 7, height = 5, dpi = 140)
 
